@@ -13,6 +13,7 @@ Clone the git repository locally, add the following in your `init.el` file:
 ```
 (add-to-list 'load-path "path/to/local/git/directory/")
 ;; so that emacs knows where to look for epub.el
+(setopt epub-font-scale 1.3)
 ```
 
 ## straight.el
