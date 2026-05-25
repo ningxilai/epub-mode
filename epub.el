@@ -1,7 +1,45 @@
-;; -*- lexical-binding: t -*-
+;;; epub.el --- EPUB reader -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026
+
+;; Author: nuggets<an@om.nom> <https://github.com/nuggets>
+;; URL: https://github.com/nuggets/epub-mode
+;; Version: 0.1
+;; Package-Requires: ((emacs "30.1"))
+;; Keywords: epub, ebook, epubreader
+
+;; This file is NOT part of GNU Emacs.
+
+;; Permission is hereby granted, free of charge, to any person
+;; obtaining a copy of this software and associated documentation
+;; files (the "Software"), to deal in the Software without
+;; restriction, including without limitation the rights to use, copy,
+;; modify, merge, publish, distribute, sublicense, and/or sell copies
+;; of the Software, and to permit persons to whom the Software is
+;; furnished to do so, subject to the following conditions:
+
+;; The above copyright notice and this permission notice shall be
+;; included in all copies or substantial portions of the Software.
+
+;; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+;; EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+;; MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+;; NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+;; BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+;; ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+;; CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+;; SOFTWARE.
+
+;;; Commentary:
+
+;; EPUB reader for Emacs.  Uses shr.el for HTML rendering.
+
+;;; Code:
+
 (require 'shr)
 (require 'imenu)
-(require 'exml-query)
+(require 'dom)
+(require 'url-util)
 
 ;; not necessary since call-process searches in exec-path
 (defvar epub-unzip-command "unzip"
@@ -53,7 +91,11 @@
 (defun epub-unzip (fpath exdir)
   ;; note that fpath and exdir are strings and absolute
   ;; literal strings containing ~ will not undergo shell expansion properly
-  (call-process epub-unzip-command nil "*epub unzip*" nil "-o" fpath "-d" exdir))
+  (call-process epub-unzip-command nil "*epub unzip*" nil "-o" fpath "-d" exdir)
+  ;; Some EPUBS store META-INF with read-only permissions (0444),
+  ;; making directories untraversable.  Ensure directories are
+  ;; traversable and files readable.
+  (call-process "chmod" nil nil nil "-R" "u+rwX" exdir))
 
 ;; Cleanup function
 (defun epub-cleanup (&optional err)
@@ -77,6 +119,10 @@
   "Return url if it is remote, nil otherwise."
   (and (url-type (url-generic-parse-url url)) url))
 
+(defun epub--decode-url (str)
+  "URL-decode STR, replacing percent-encoded characters."
+  (if str (url-unhex-string str) str))
+
 (defun epub-locate-container-file (dir)
   "Given the directory (that includes the EPUB OCF container) dir,
 return absolute URL of the container.xml file,
@@ -89,14 +135,14 @@ typicall located under **/root/META-INF/."
 					      dir-list))))))
 
 (defun epub-locate-package-doc (container-file-url)
-  "Given the url of the container file 'container.xml',
+  "Given the url of the container file `container.xml',
 return the absolute url of the package document.
-The relative url is found in the 'rootfile' element, after parsing the container file."
+The relative url is found in the `rootfile' element, after parsing
+the container file."
   ;; Package document url is relative to the root URL,
   ;; see https://www.w3.org/TR/epub/#sec-parsing-urls-metainf
   (let* ((pt (epub-parse-xml container-file-url))
-	 (node (exml-find '("*" nil (rootfile nil))
-			  pt)))
+	 (node (car (dom-by-tag pt 'rootfile))))
     (expand-file-name (dom-attr node 'full-path) epub-root-url)))
 
 ;; The package document parse trees includes:
@@ -108,7 +154,7 @@ The relative url is found in the 'rootfile' element, after parsing the container
 ;; - the navigation document used as TOC,
 ;; not mandatorily included in the spine.
 (defun epub-parse-package-doc ()
-  "Parse the package document, located at 'epub-package-doc-url'."
+  "Parse the package document, located at `epub-package-doc-url'."
   (let* ((pt (epub-parse-xml epub-package-doc-url))
 	 (pid (epub-get-pub-id pt))
 	 (nav-id (epub-get-nav-doc-id pt))
@@ -138,15 +184,20 @@ return the publication version."
   "Given the package document parse tree package-doc-pt,
 return the publication unique identifier."
   (let ((node
-	 (or (exml-find '("*" nil (identifier (("=" scheme "uuid"))))
-			package-doc-pt)
-	     (exml-find '("*" nil (identifier (("$=" id "ISBN"))))
-			package-doc-pt))))
+	 (or (car (dom-search package-doc-pt
+			      (lambda (n)
+				(and (eq (dom-tag n) 'identifier)
+				     (equal (dom-attr n 'scheme) "uuid")))))
+	     (car (dom-search package-doc-pt
+			      (lambda (n)
+				(and (eq (dom-tag n) 'identifier)
+				     (let ((id (dom-attr n 'id)))
+				       (and id (string-match-p "ISBN$" id))))))))))
     (if node
-	(car (node-children node))
+	(car (dom-children node))
       (let ((title
-	     (exml-find '("*" nil (title nil)) package-doc-pt)))
-	(md5 (car (node-children title)))))))
+	     (car (dom-by-tag package-doc-pt 'title))))
+	(md5 (car (dom-children title)))))))
 
 ;; In EPUB 3.x, navigation document is declared using the "nav property",
 ;; within the manifest element,
@@ -159,18 +210,20 @@ return the publication unique identifier."
 return the item id of the navigation document, as indexed in the manifest."
   (pcase (epub-get-pub-version pt)
     ((and vs (guard (version< vs "3")))
-     (let ((spine (exml-find '("*" nil (spine nil)) pt)))
+     (let ((spine (car (dom-by-tag pt 'spine))))
        (dom-attr spine 'toc)))
     (_
-     (let ((node (exml-find '("*" nil (item (("*=" properties "nav"))))
-			    pt)))
+     (let ((node (car (dom-search pt
+				  (lambda (n)
+				    (and (eq (dom-tag n) 'item)
+					 (let ((props (dom-attr n 'properties)))
+					   (and props (string-match-p "nav" props)))))))))
        (dom-attr node 'id)))))
 
 (defun epub-get-manifest-tb (package-doc-pt)
-  "Given the package document parse tree package-doc-pt,
-return a hashtable, mapped from (manifest) item id to absolute url and media type."
-  (let* ((records (exml-findall '("*" nil (manifest nil ("*" nil) (item nil)))
-				package-doc-pt))
+  "Given the package document parse tree PACKAGE-DOC-PT,
+return a hashtable mapping item id to absolute url and media type."
+  (let* ((records (dom-by-tag package-doc-pt 'item))
 	 (tb (make-hash-table :test #'equal
 			      :size (length records))))
     ;; the url specified by the href attribute must be an absolute- or
@@ -178,7 +231,7 @@ return a hashtable, mapped from (manifest) item id to absolute url and media typ
     ;; see https://www.w3.org/TR/epub/#sec-item-elem.
     (mapc (lambda (node)
 	    (let* ((id (dom-attr node 'id))
-		   (href (dom-attr node 'href))
+		   (href (epub--decode-url (dom-attr node 'href)))
 		   (type (dom-attr node 'media-type))
 		   ;; base-url is pkg doc directory
 		   (base-url (file-name-directory epub-package-doc-url))
@@ -195,10 +248,9 @@ Each element in the array is a pair of item id and the id of the next item,
 (id . id-next), with the last element being (last-id . nil)."
   (let* ((max-lisp-eval-depth 12800)
 	 (nodes
-	  (exml-findall '("*" nil (spine nil ("*" nil) (itemref nil)))
-			package-doc-pt))
+	  (dom-by-tag package-doc-pt 'itemref))
 	 (ids
-	  (mapcar (apply-partially #'node-attr 'idref) nodes))
+	  (mapcar (lambda (nd) (dom-attr nd 'idref)) nodes))
 	 (ids-shift1 (cdr (nconc ids '(nil)))) ;; note ids is changed due to side effect.
 	 (spine (cl-mapcar #'cons ids ids-shift1))
 	 ;; since toc is possibly absent in spine,
@@ -208,60 +260,42 @@ Each element in the array is a pair of item id and the id of the next item,
 		  (cons (cons epub-toc-id (caar spine)) spine))))
     spine))
 
+(defvar-keymap epub-shr-map
+  :parent shr-map
+  "<mouse-2>" 'epub-browse-url
+  "RET" 'epub-browse-url)
+
 ;; Custom rendering functions overriding default 'shr-tag-img'.
 (defun epub-tag-img (dom)
-  (let ((url (dom-attr dom 'src)))
+  (let ((url (epub--decode-url (dom-attr dom 'src))))
     (if (epub-url-remotep url)
 	(shr-tag-img dom)
-      ;; resolve url locally if pointing to a resouce in the container.
-      (let* ((start (point-marker))
-	     (title (dom-attr dom 'title))
-	     (alt (or (dom-attr dom 'alt)
-		      "missing alt attr"))
+      (let* ((file (expand-file-name url))
 	     (width (shr-string-number (dom-attr dom 'width)))
 	     (height (shr-string-number (dom-attr dom 'height)))
-	     (url (expand-file-name url)) ;; current buffer directory is expanded upon
-	     ;; as urls in content documents are relative to the document itself.
-	     (image (epub-create-image url (list :width width :height height))))
-	(when image
-	  (when (and (> (current-column) 0)
-		     (> (car (image-size image t)) 400))
-	    (insert "\n"))
-	  (insert-image image alt)
-	  ;; multi-frame image unimplemented...
-	  (when (zerop shr-table-depth) ;; not in a table.
-	    ;; (put-text-property start (point) 'keymap shr-image-map)
-	    (put-text-property start (point) 'shr-alt alt)
-	    (put-text-property start (point) 'image-url url)
-	    (put-text-property start (point) 'help-echo
-			       (shr-fill-text (or title alt)))))))))
-
-(defun epub-create-image (url &optional flags)
-  "Given a resource url, return an image object.
-A wrapper for 'create-image'."
-  ;; create image within window limit if window is assigned
-  (if (null (get-buffer-window (current-buffer) t))
-      (create-image url nil nil :ascent 100) ;; no existing window for buffer
-    (seq-let (lft top rgt bot) (window-body-pixel-edges
-				(get-buffer-window (current-buffer)))
-      (let ((width (plist-get flags :width))
-	    (height (plist-get flags :height))
-	    (max-width (truncate (* shr-max-image-proportion (- rgt lft))))
-	    (max-height (truncate (* shr-max-image-proportion (- bot top))))
-	    (scaling (image-compute-scaling-factor image-scaling-factor)))
-	;; (message (format "img %s width: %s, height %s" url width height))
-	;; scaling is no smaller than 1
-	(if (and width height
-		 (< (* width scaling) max-width)
-		 (< (* height scaling) max-height))
-            (create-image url (shr--image-type) nil
-			  :ascent 100
-			  :width width
-			  :height height)
-          (create-image url (shr--image-type) nil
-			:ascent 100
-			:max-width max-width
-			:max-height max-height))))))
+	     (title (dom-attr dom 'title))
+	     (alt (or (dom-attr dom 'alt) "missing alt attr")))
+	(when (file-exists-p file)
+	  (let* ((start (point-marker))
+		 (data (with-temp-buffer
+			 (set-buffer-multibyte nil)
+			 (insert-file-contents-literally file)
+			 (buffer-string)))
+		 (content-type (pcase (file-name-extension file)
+				("jpg" 'image/jpeg)
+				("jpeg" 'image/jpeg)
+				("png" 'image/png)
+				("gif" 'image/gif)
+				("svg" 'image/svg+xml)
+				(_ nil)))
+		 (spec (list data content-type)))
+	    (funcall shr-put-image-function spec alt
+		     (list :width width :height height))
+	    (when (zerop shr-table-depth)
+	      (put-text-property start (point) 'shr-alt alt)
+	      (put-text-property start (point) 'image-url file)
+	      (put-text-property start (point) 'help-echo
+				 (shr-fill-text (or title alt))))))))))
 
 ;; Override shr-url-transformer in <a> tag such that,
 ;; the url passed into 'urlify' is absolute.
@@ -285,17 +319,17 @@ A wrapper for 'create-image'."
     (buffer-string)))
 
 (defun epub--ncx-to-html (dom)
-  (pcase (node-tag dom)
+  (pcase (dom-tag dom)
     ('navMap
      (insert "<ol>\n")
-     (mapc #'epub--ncx-to-html (node-children dom))
+     (mapc #'epub--ncx-to-html (dom-children dom))
      (insert "</ol>\n"))
     
     ('navPoint
-     (let* ((label (exml-find '("*" nil (text nil)) dom))
-	    (content (exml-find '("*" nil (content nil)) dom))
+     (let* ((label (car (dom-by-tag dom 'text)))
+	    (content (car (dom-by-tag dom 'content)))
 	    (label (car (dom-children label)))
-	    (href (expand-file-name (node-attr 'src content)
+	    (href (expand-file-name (dom-attr content 'src)
 				    epub-root-url)))
        (unless href
 	 (warn "content href missing: %s" label))
@@ -303,29 +337,29 @@ A wrapper for 'create-image'."
        (insert (format "<a href=\"%s\">%s</a>\n"
 		       (xml-escape-string (or href " "))
 		       (xml-escape-string (or label "missing label"))))
-       (if-let ((children
-		 (exml-findall '(navPoint nil ("*" nil) (navPoint nil))
-			       dom)))
+       (if-let* ((children
+		 (dom-by-tag dom 'navPoint)))
 	   (mapc #'epub--ncx-to-html children))
        (insert "</li>\n")))
     (tag (error (format "cannot handle tag: %s" tag)))))
 
 (defun epub-walk-ncx-node (dom)
   "Transform a ncx dom tree to an xml dom tree."
-  (pcase (node-tag dom)
+  (pcase (dom-tag dom)
     ('navMap
      (let ((ch
-	    (mapcar #'epub-walk-ncx-node (node-children dom))))
+	    (mapcar #'epub-walk-ncx-node (dom-children dom))))
        `(ol nil ,@ch)))
     
     ('navPoint
-     (let* ((label (exml-find '("*" nil (text nil)) dom))
-	    (label (car (dom-children label)))
-	    (content (exml-find '("*" nil (content nil)) dom))
-	    (href (node-attr 'src content))
-	    ;; (href (expand-file-name (node-attr 'src content) epub-root-url))
-	    (ch (exml-findall '(navPoint nil ("*" nil) (navPoint nil)) dom))
-	    (ch (and ch (mapcar #'epub-walk-ncx-node ch))))
+     (let* ((label (car (dom-by-tag dom 'text)))
+            (label (car (dom-children label)))
+            (content (car (dom-by-tag dom 'content)))
+            (href (dom-attr content 'src))
+            (ch (cl-remove-if-not
+		 (lambda (n) (eq (dom-tag n) 'navPoint))
+		 (dom-children dom)))
+	    (ch (mapcar #'epub-walk-ncx-node ch)))
        (unless href
 	 (warn "content href missing: %s" label))
        `(li nil (a ((href . ,href)) ,label) ,@ch)))
@@ -343,11 +377,6 @@ A wrapper for 'create-image'."
   "k" 'previous-line
   "t" 'epub-goto-toc
   )
-
-(defvar-keymap epub-shr-map
-  :parent shr-map
-  "<mouse-2>" 'epub-browse-url
-  "RET" 'epub-browse-url)
 
 ;; Retrive content information using manifest id
 (defun manifest-get (cid prop)
@@ -384,7 +413,7 @@ return property value from the manifest table."
 ;; while next/previous pages are accessed through id.
 (defun epub-goto-content-helper (url-or-id &optional pnt target)
   (pcase (gethash url-or-id epub-manifest-table)
-    (`(,url ,tp)
+    (`(,url ,_)
      (epub-goto-content url-or-id url pnt target))
     ((and 'nil
 	  (let cid (gethash url-or-id epub-url-table)))
@@ -419,7 +448,7 @@ return property value from the manifest table."
     (pcase tp
       ((pred (string-match "dtbncx")) ;; A ncx TOC file, requires translation
        (let* ((pt (epub-parse-xml url))
-	      (dom (exml-find '("*" nil (navMap nil)) pt))
+	      (dom (car (dom-by-tag pt 'navMap)))
 	      (dom (epub-walk-ncx-node dom)))
 	 (epub-render-html dom epub-root-url)))
       (_
@@ -427,16 +456,84 @@ return property value from the manifest table."
 	 (epub-render-html dom url))))
     ))
 
+(defun epub--svg-resolve-images (dom)
+  "Replace local image hrefs in SVG DOM with inline data URIs."
+  (dolist (child (dom-children dom))
+    (when (consp child)
+      (if (eq (dom-tag child) 'image)
+          (let* ((url (epub--decode-url
+                        (or (dom-attr child 'href)
+                            (dom-attr child 'xlink:href))))
+                 (file (and url (expand-file-name url))))
+            (when (and file (file-exists-p file))
+              (with-temp-buffer
+                (set-buffer-multibyte nil)
+                (insert-file-contents-literally file)
+                (let* ((ext (file-name-extension file))
+                       (mime (pcase ext
+                               ("jpg" "image/jpeg")
+                               ("jpeg" "image/jpeg")
+                               ("png" "image/png")
+                               ("gif" "image/gif")
+                               (_ "image/jpeg")))
+                       (data (concat "data:" mime ";base64,"
+                                     (base64-encode-string (buffer-string) t))))
+                  (dom-set-attribute child 'href data)))))
+        (epub--svg-resolve-images child)))))
+
+(defun epub-tag-svg (dom)
+  "Render inline SVG, extracting local images from simple wrappers."
+  (when (and (image-type-available-p 'svg)
+             (not shr-inhibit-images))
+    (let ((children (dom-children dom))
+          (all-image t))
+      (dolist (c children)
+        (unless (and (consp c) (eq (dom-tag c) 'image))
+          (setq all-image nil)))
+      (if (and children all-image)
+          (let (any-inserted)
+            (dolist (child children)
+              (let* ((url (epub--decode-url
+                           (or (dom-attr child 'href)
+                               (dom-attr child 'xlink:href))))
+                     (file (and url (expand-file-name url))))
+                (when (and file (file-exists-p file))
+                  (let* ((data (with-temp-buffer
+                                (set-buffer-multibyte nil)
+                                (insert-file-contents-literally file)
+                                (buffer-string)))
+                         (ext (file-name-extension file))
+                         (content-type (pcase ext
+                                         ("jpg" 'image/jpeg)
+                                         ("jpeg" 'image/jpeg)
+                                         ("png" 'image/png)
+                                         ("gif" 'image/gif)
+                                         (_ nil))))
+                    (setq any-inserted t)
+                    (funcall shr-put-image-function
+                             (list data content-type)
+                             (or (dom-attr child 'alt) ""))))))
+            (unless any-inserted
+              (epub--svg-resolve-images dom)
+              (shr-tag-svg dom)))
+        (progn
+          (epub--svg-resolve-images dom)
+          (shr-tag-svg dom))))))
+
 (defun epub-render-html (dom &optional url)
   "Render the html content file in the current buffer.
 Url is necessary to resolve dom elements with relative urls to absolute urls."
   (let ((shr-external-rendering-functions '((img . epub-tag-img)
-					    (a . epub-tag-a)))
+					    (a . epub-tag-a)
+					    (svg . epub-tag-svg)))
 	(default-directory (if url (file-name-directory url)
 			     default-directory))
 	buffer-read-only ;; so that buffer can be modified
 	)
     (erase-buffer)
+    ;; Ensure SHR can constrain images to window dimensions.
+    (unless (get-buffer-window (current-buffer) t)
+      (set-window-buffer (selected-window) (current-buffer)))
     (shr-insert-document dom)
     (set-buffer-modified-p nil)
     (goto-char (point-min)) ;; start at the front by default
@@ -498,8 +595,8 @@ Url is necessary to resolve dom elements with relative urls to absolute urls."
 	  ents))
 
 (defun epub-save-progress ()
-  "Save current reading progress to designated file, 'epub-progress-file'.
-Progress data is a list of progress entries, each is a list of (publication-id, content-id, point)."
+  "Save current reading progress to `epub-progress-file'.
+Progress data is a list of (publication-id content-id point)."
   (when epub-progress-file
     (let* ((prev-ents (epub-retrive-progress-all))
 	   (ent
@@ -524,11 +621,13 @@ Progress data is a list of progress entries, each is a list of (publication-id, 
 	(error (format "Failed to retrieve progress: %s" err))))))
 
 (defun epub-retrive-progress (id)
-  "Return progress entry for specific publication if given id, return nil if the corresponding publication id is not found."
+  "Return progress entry for publication ID, or nil if not found."
   ;; read is used when reading from progress file, changing integer strings to integers.
   (assoc id (epub-retrive-progress-all)))
 
 ;; major mode
+;;;###autoload (add-to-list 'auto-mode-alist '("\\.epub\\'" . epub-mode))
+;;;###autoload
 (define-derived-mode epub-mode special-mode "EPUB"
   "Major mode for epub files"
   (add-hook 'change-major-mode-hook 'epub-cleanup nil t)
@@ -578,17 +677,18 @@ Progress data is a list of progress entries, each is a list of (publication-id, 
   (setq imenu-create-index-function #'epub-imenu-create-index-function)
   (setq imenu-default-goto-function #'epub-imenu-goto-function)
 
-  (if-let ((prog (and epub-resume-progress
-		      (epub-retrive-progress epub-publication-id)))
-	   (cid (nth 1 prog))
-	   (pnt (nth 2 prog)))
-      (progn
-	(message (format "previous progress: %s" prog))
-	(condition-case err
-	    (epub-goto-content-helper cid pnt)
-	  (epub-cleanup t)))
-    (let ((front (cdar epub-spine-alist)))
-      (epub-goto-content-helper front))))
+  (let* ((prog (and epub-resume-progress
+		    (epub-retrive-progress epub-publication-id)))
+	 (cid (nth 1 prog))
+	 (pt (nth 2 prog))
+	 (valid (and cid pt (gethash cid epub-manifest-table))))
+    (if valid
+	(condition-case nil
+	    (epub-goto-content-helper cid pt)
+	  ((error) (epub-cleanup t)))
+      (condition-case nil
+	  (epub-goto-content-helper (cdar epub-spine-alist))
+	((error) (epub-cleanup t))))))
 
 ;; imenu interop
 ;; (defvar-local imenu-create-index-function
@@ -597,7 +697,7 @@ Progress data is a list of progress entries, each is a list of (publication-id, 
 ;; the imenu utility is incorporated by customizing
 ;; 'imenu-create-index-function and 'imenu-default-goto-function
 
-(defun epub-imenu-goto-function (descp url &rest args)
+(defun epub-imenu-goto-function (_descp url &rest _args)
   (epub-goto-content-helper url))
 
 ;; callstack of imenu
@@ -622,24 +722,25 @@ Progress data is a list of progress entries, each is a list of (publication-id, 
 
 (defun epub-imenu-create-index-from-ncx (pt base-dir)
   (let ((nl
-	 (exml-findall '("*" nil (navPoint nil)) pt)))
+	 (dom-by-tag pt 'navPoint)))
     (mapcar (lambda (nd)
 	      (let ((text
-		     (exml-find '("*" nil (text nil)) nd))
+		     (car (dom-by-tag nd 'text)))
 		    (content
-		     (exml-find '("*" nil (content nil)) nd)))
-		(cons (dom-text text)
+		     (car (dom-by-tag nd 'content))))
+		(cons (dom-inner-text text)
 		      (expand-file-name (dom-attr content 'src)
 					base-dir))))
 	    nl)))
 
 (defun epub-imenu-create-index-from-nav (pt base-dir)
-  (let* ((nd (exml-find '("*" nil
-			  (nav (("=" type "toc"))
-			       ("*" nil (ol nil))))
-			pt))
+  (let* ((nav (car (dom-search pt
+			       (lambda (n)
+				 (and (eq (dom-tag n) 'nav)
+				      (equal (dom-attr n 'type) "toc"))))))
+	 (nd (car (dom-by-tag nav 'ol)))
 	 (menu (mapcan (apply-partially #'epub-imenu-walk-li "")
-		       (node-children nd))))
+		       (dom-children nd))))
     (message (format "%s" menu))
     (mapcar (lambda (ele)
 	      (pcase ele
@@ -665,13 +766,12 @@ base-dir is the directory of the nav file."
 	      (mapcan (apply-partially #'epub-imenu-walk-li
 				       (concat (and (epub-str-non-null name) "-")
 					       idnt))
-		      (node-children ol)))))
+		      (dom-children ol)))))
     ))
 
 (defun epub-imenu-walk-a (nd)
   "Walk an a tag and return the embedded text."
-  (or (epub-str-non-null (dom-text nd))
-      (mapconcat #'dom-text (node-children nd) " ")))
+  (dom-inner-text nd))
 
 (defun epub-str-non-null (s)
   (and (not (null s))

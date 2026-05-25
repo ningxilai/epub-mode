@@ -61,8 +61,8 @@ Features for basic highlighting and commenting are underway.
 
 ## Miscellaneous
 ### xml query
-For those interested in learning more about the xml query library in elisp, check out `exml-query.el`. Some basic use cases and tests are provided.
+epub-mode uses Emacs's built-in `dom.el` for XML querying — `dom-by-tag` and `dom-search` for tree traversal and attribute matching.
 
 ### benchmarks
-`<root>/tests/bench-query.el` provides some simple functions for benchmarking and comparing the performances of the two query libraries used by nov.el and epub.el, using the sample epub files under the "<root>/tests/containers/" directory.
+`<root>/tests/bench-query.el` provides some simple functions for benchmarking and comparing the query approaches used by nov.el (`esxml-query`) and epub.el (`dom.el`), using the sample epub files under the "<root>/tests/containers/" directory.
 
