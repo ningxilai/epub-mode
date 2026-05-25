@@ -2,8 +2,8 @@
 
 ;; Copyright (C) 2026
 
-;; Author: nuggets<an@om.nom> <https://github.com/nuggets>
-;; URL: https://github.com/nuggets/epub-mode
+;; Author: PeteLeng <pete_leng@126.com>
+;; URL: https://github.com/PeteLeng/epub-mode
 ;; Version: 0.1
 ;; Package-Requires: ((emacs "30.1"))
 ;; Keywords: epub, ebook, epubreader
