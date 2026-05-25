@@ -578,7 +578,8 @@ Progress data is a list of (publication-id content-id point)."
   (assoc id (epub-retrive-progress-all)))
 
 ;; major mode
-;;;###autoload (add-to-list 'auto-mode-alist '("\\.epub\\'" . epub-mode))
+;;;###autoload
+(add-to-list 'auto-mode-alist '("\\.epub\\'" . epub-mode))
 ;;;###autoload
 (define-derived-mode epub-mode special-mode "EPUB"
   "Major mode for epub files"
