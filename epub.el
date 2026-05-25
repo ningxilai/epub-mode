@@ -10,13 +10,12 @@
 (require 'imenu)
 (require 'dom)
 (require 'url-util)
+(require 'cl-lib)
 
-;; not necessary since call-process searches in exec-path
-(defvar epub-unzip-command "unzip"
-  "Commnad to unzip epub files.")
-
-(defvar epub-progress-file (locate-user-emacs-file "epub.prog")
-  "File used for saving and restoring reading progress.")
+(defcustom epub-progress-file (locate-user-emacs-file "epub.prog")
+  "File used for saving and restoring reading progress."
+  :type 'file
+  :group 'epub)
 
 (defvar-local epub-unzip-exdir nil
   "Temporary directory to which the epub file extracts.")
@@ -48,14 +47,20 @@
 (defvar-local epub-current-content-id nil
   "File id of the document currently reading.")
 
-(defvar-local epub-scroll-pct 0.75
-  "Percentage of screen height scrolled up and down.")
+(defcustom epub-scroll-pct 0.75
+  "Percentage of screen height scrolled up and down."
+  :type 'float
+  :group 'epub)
 
-(defvar-local epub-scroll-beyond t
-  "Scroll to previous or next page at the beginning or end of the current page.")
+(defcustom epub-scroll-beyond t
+  "When non-nil, scroll beyond page boundaries to change chapters."
+  :type 'boolean
+  :group 'epub)
 
-(defvar epub-resume-progress t
-  "Resume from the last position when reopening epub files.")
+(defcustom epub-resume-progress t
+  "Resume from the last position when reopening epub files."
+  :type 'boolean
+  :group 'epub)
 
 (defgroup epub nil
   "EPUB reader for Emacs."
@@ -67,11 +72,30 @@
   :group 'epub)
 
 
+(defun epub--image-type (ext)
+  "Return image type symbol for file extension EXT, or nil."
+  (and ext
+       (pcase (downcase ext)
+	 ("jpg" 'image/jpeg)
+	 ("jpeg" 'image/jpeg)
+	 ("png" 'image/png)
+	 ("gif" 'image/gif)
+	 ("svg" 'image/svg+xml))))
+
+
+(defun epub--manifest-media-type (cid)
+  "Return media type for content id CID from the manifest."
+  (or (nth 1 (gethash cid epub-manifest-table))
+      (error "content id not found: %s" cid)))
+
+(defun epub--manifest-url-put (tb k val)
+  "Into TB, index the URL from manifest entry VAL by key K."
+  (puthash (car val) k tb))
+
+
 ;; Unzip epub file
 (defun epub-unzip (fpath exdir)
-  ;; note that fpath and exdir are strings and absolute
-  ;; literal strings containing ~ will not undergo shell expansion properly
-  (call-process epub-unzip-command nil "*epub unzip*" nil "-o" fpath "-d" exdir)
+  (call-process "unzip" nil "*epub unzip*" nil "-o" fpath "-d" exdir)
   ;; Some EPUBS store META-INF with read-only permissions (0444),
   ;; making directories untraversable.  Ensure directories are
   ;; traversable and files readable.
@@ -104,15 +128,15 @@
   (if str (url-unhex-string str) str))
 
 (defun epub-locate-container-file (dir)
-  "Given the directory (that includes the EPUB OCF container) dir,
-return absolute URL of the container.xml file,
-typicall located under **/root/META-INF/."
-  (named-let locate-container ((dir-list `(,dir)))
-    (or (locate-file "container.xml" dir-list)
-	(locate-container (seq-filter #'file-directory-p
-				      (mapcan (lambda (f)
-						(directory-files f t "[^.]"))
-					      dir-list))))))
+  "Return absolute URL of the container.xml file under DIR."
+  (cl-labels ((locate-container (dir-list)
+		(or (locate-file "container.xml" dir-list)
+		    (locate-container
+		     (seq-filter #'file-directory-p
+				 (mapcan (lambda (f)
+					   (directory-files f t "[^.]"))
+					 dir-list))))))
+    (locate-container (list dir))))
 
 (defun epub-locate-package-doc (container-file-url)
   "Given the url of the container file `container.xml',
@@ -151,7 +175,7 @@ the container file."
       (setq epub-spine-alist spine)
       (let ((urltb (make-hash-table :test #'equal
 				    :size (hash-table-count manifest))))
-        (maphash (lambda (k val) (puthash (car val) k urltb))
+        (maphash (apply-partially #'epub--manifest-url-put urltb)
 		 manifest)
 	(setq epub-url-table urltb)))))
 
@@ -261,13 +285,8 @@ Each element in the array is a pair of item id and the id of the next item,
 			 (set-buffer-multibyte nil)
 			 (insert-file-contents-literally file)
 			 (buffer-string)))
-		 (content-type (pcase (file-name-extension file)
-				("jpg" 'image/jpeg)
-				("jpeg" 'image/jpeg)
-				("png" 'image/png)
-				("gif" 'image/gif)
-				("svg" 'image/svg+xml)
-				(_ nil)))
+		 (content-type (epub--image-type
+				(file-name-extension file)))
 		 (spec (list data content-type)))
 	    (funcall shr-put-image-function spec alt
 		     (list :width width :height height))
@@ -289,39 +308,6 @@ Each element in the array is a pair of item id and the id of the next item,
 				   (expand-file-name url))))
 	(shr-map epub-shr-map))
     (shr-tag-a dom)))
-
-;; Translate ncx to html (for backward compatibility).
-;; NCX files for navigation are replaced by navigation document since 3.x.
-;; https://www.w3.org/TR/epub/#sec-opf2-ncx
-(defun epub-ncx-to-html (dom)
-  (with-temp-buffer
-    (epub--ncx-to-html dom)
-    (buffer-string)))
-
-(defun epub--ncx-to-html (dom)
-  (pcase (dom-tag dom)
-    ('navMap
-     (insert "<ol>\n")
-     (mapc #'epub--ncx-to-html (dom-children dom))
-     (insert "</ol>\n"))
-    
-    ('navPoint
-     (let* ((label (car (dom-by-tag dom 'text)))
-	    (content (car (dom-by-tag dom 'content)))
-	    (label (car (dom-children label)))
-	    (href (expand-file-name (dom-attr content 'src)
-				    epub-root-url)))
-       (unless href
-	 (warn "content href missing: %s" label))
-       (insert "<li>\n")
-       (insert (format "<a href=\"%s\">%s</a>\n"
-		       (xml-escape-string (or href " "))
-		       (xml-escape-string (or label "missing label"))))
-       (if-let* ((children
-		 (dom-by-tag dom 'navPoint)))
-	   (mapc #'epub--ncx-to-html children))
-       (insert "</li>\n")))
-    (tag (error (format "cannot handle tag: %s" tag)))))
 
 (defun epub-walk-ncx-node (dom)
   "Transform a ncx dom tree to an xml dom tree."
@@ -358,20 +344,6 @@ Each element in the array is a pair of item id and the id of the next item,
   "t" 'epub-goto-toc
   )
 
-;; Retrive content information using manifest id
-(defun manifest-get (cid prop)
-  "Given content id cid and property prop,
-return property value from the manifest table."
-  (let ((vals (gethash cid epub-manifest-table)))
-    (unless vals
-      (message (format "content id: %s" cid))
-      (error (format "content id not exist: %s" cid))
-      (throw 'exit-without-save t))
-    (pcase prop
-      (:url (nth 0 vals))
-      (:media-type (nth 1 vals))
-      (_ (error (format "unknown content property: %s" prop))))))
-
 ;; Browse url
 (defun epub-browse-url (&optional mouse-event)
   (interactive (list last-nonmenu-event))
@@ -403,7 +375,7 @@ return property value from the manifest table."
 ;; The lowest level fucntion for navigating content documents.
 (defun epub-goto-content (cid url pnt target)
   "Given content id and url, render content document."
-  (let ((tp (manifest-get cid :media-type)))
+  (let ((tp (epub--manifest-media-type cid)))
     (message (format "goto url: %s" url))
     (epub-render-content url tp)
     ;; update current content id.
@@ -423,8 +395,8 @@ return property value from the manifest table."
 (defun epub-render-content (url &optional tp)
   "Render the specified content in the current buffer."
   (let ((tp (or tp
-		(manifest-get (gethash url epub-url-table)
-			      :media-type))))
+		(epub--manifest-media-type
+		 (gethash url epub-url-table)))))
     (pcase tp
       ((pred (string-match "dtbncx")) ;; A ncx TOC file, requires translation
        (let* ((pt (epub-parse-xml url))
@@ -449,13 +421,9 @@ return property value from the manifest table."
               (with-temp-buffer
                 (set-buffer-multibyte nil)
                 (insert-file-contents-literally file)
-                (let* ((ext (file-name-extension file))
-                       (mime (pcase ext
-                               ("jpg" "image/jpeg")
-                               ("jpeg" "image/jpeg")
-                               ("png" "image/png")
-                               ("gif" "image/gif")
-                               (_ "image/jpeg")))
+                (let* ((mime (or (symbol-name (epub--image-type
+                                               (file-name-extension file)))
+                                "image/jpeg"))
                        (data (concat "data:" mime ";base64,"
                                      (base64-encode-string (buffer-string) t))))
                   (dom-set-attribute child 'href data)))))
@@ -482,13 +450,8 @@ return property value from the manifest table."
                                 (set-buffer-multibyte nil)
                                 (insert-file-contents-literally file)
                                 (buffer-string)))
-                         (ext (file-name-extension file))
-                         (content-type (pcase ext
-                                         ("jpg" 'image/jpeg)
-                                         ("jpeg" 'image/jpeg)
-                                         ("png" 'image/png)
-                                         ("gif" 'image/gif)
-                                         (_ nil))))
+                         (content-type (epub--image-type
+                                        (file-name-extension file))))
                     (setq any-inserted t)
                     (funcall shr-put-image-function
                              (list data content-type)
