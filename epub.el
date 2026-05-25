@@ -57,8 +57,15 @@
 (defvar epub-resume-progress t
   "Resume from the last position when reopening epub files.")
 
-(defvar epub-after-render-hook nil
-  "Hook run after rendering each content document.")
+(defgroup epub nil
+  "EPUB reader for Emacs."
+  :group 'applications)
+
+(defcustom epub-font-scale 1.0
+  "Font size scaling factor for EPUB content."
+  :type 'float
+  :group 'epub)
+
 
 ;; Unzip epub file
 (defun epub-unzip (fpath exdir)
@@ -504,13 +511,18 @@ Url is necessary to resolve dom elements with relative urls to absolute urls."
 	buffer-read-only ;; so that buffer can be modified
 	)
     (erase-buffer)
+    (when (not (= epub-font-scale 1.0))
+      (setq-local face-remapping-alist
+                  `((default default (:height ,epub-font-scale))
+                    (variable-pitch variable-pitch
+                                    (:height ,epub-font-scale)))))
     ;; Ensure SHR can constrain images to window dimensions.
     (unless (get-buffer-window (current-buffer) t)
       (set-window-buffer (selected-window) (current-buffer)))
     (shr-insert-document dom)
     (set-buffer-modified-p nil)
     (goto-char (point-min)) ;; start at the front by default
-    (run-hooks 'epub-after-render-hook)))
+    ))
 
 (defun epub-next-chap ()
   "Go to next content in the spine."
