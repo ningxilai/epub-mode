@@ -185,22 +185,19 @@ return the publication version."
   (dom-attr package-doc-pt 'version))
 
 (defun epub-get-pub-id (package-doc-pt)
-  "Given the package document parse tree package-doc-pt,
-return the publication unique identifier."
-  (let ((node
-	 (or (car (dom-search package-doc-pt
-			      (lambda (n)
-				(and (eq (dom-tag n) 'identifier)
-				     (equal (dom-attr n 'scheme) "uuid")))))
-	     (car (dom-search package-doc-pt
-			      (lambda (n)
-				(and (eq (dom-tag n) 'identifier)
-				     (let ((id (dom-attr n 'id)))
-				       (and id (string-match-p "ISBN$" id))))))))))
+  "Return the publication unique identifier.
+
+Finds the <dc:identifier> whose id matches the <package> element's
+`unique-identifier' attribute, per the EPUB 3/2 specs."
+  (let* ((uid-attr (dom-attr package-doc-pt 'unique-identifier))
+	 (node (and uid-attr
+		    (car (dom-search package-doc-pt
+				     (lambda (n)
+				       (and (eq (dom-tag n) 'identifier)
+					    (equal (dom-attr n 'id) uid-attr))))))))
     (if node
 	(car (dom-children node))
-      (let ((title
-	     (car (dom-by-tag package-doc-pt 'title))))
+      (let ((title (car (dom-by-tag package-doc-pt 'title))))
 	(md5 (car (dom-children title)))))))
 
 ;; In EPUB 3.x, navigation document is declared using the "nav property",
@@ -253,8 +250,15 @@ Each element in the array is a pair of item id and the id of the next item,
   (let* ((max-lisp-eval-depth 12800)
 	 (nodes
 	  (dom-by-tag package-doc-pt 'itemref))
+	 ;; Per §5.5 Spine, filter out non-linear items from the
+	 ;; default reading order.  First linear itemref is the
+	 ;; beginning of the reading order.
+	 (linear-nodes
+	  (cl-remove-if (lambda (nd)
+			  (equal (dom-attr nd 'linear) "no"))
+			nodes))
 	 (ids
-	  (mapcar (lambda (nd) (dom-attr nd 'idref)) nodes))
+	  (mapcar (lambda (nd) (dom-attr nd 'idref)) linear-nodes))
 	 (ids-shift1 (cdr (nconc ids '(nil)))) ;; note ids is changed due to side effect.
 	 (spine (cl-mapcar #'cons ids ids-shift1))
 	 ;; since toc is possibly absent in spine,
