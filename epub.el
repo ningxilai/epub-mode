@@ -57,6 +57,9 @@
 (defvar epub-resume-progress t
   "Resume from the last position when reopening epub files.")
 
+(defvar epub-after-render-hook nil
+  "Hook run after rendering each content document.")
+
 ;; Unzip epub file
 (defun epub-unzip (fpath exdir)
   ;; note that fpath and exdir are strings and absolute
@@ -507,7 +510,7 @@ Url is necessary to resolve dom elements with relative urls to absolute urls."
     (shr-insert-document dom)
     (set-buffer-modified-p nil)
     (goto-char (point-min)) ;; start at the front by default
-    ))
+    (run-hooks 'epub-after-render-hook)))
 
 (defun epub-next-chap ()
   "Go to next content in the spine."
